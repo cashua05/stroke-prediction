@@ -1,0 +1,377 @@
+
+# Stroke Prediction Project (MAST6100)
+# Full analysis script with clear comments for assessment criteria
+
+
+
+# 0) Setup: packages + data
+
+
+# Load required libraries (install first if needed)
+library(tidyverse)   # data wrangling + ggplot2
+library(caret)       # train/test split, confusionMatrix, CV training
+library(pROC)        # ROC curves + AUC
+library(keras3)      # deep learning (Keras in R)
+library(kernlab)     # SVM backend used by caret
+
+# Read the dataset (make sure the CSV is in your working directory)
+stroke <- read.csv("healthcare-dataset-stroke-data.csv")
+
+# Optional: quick structure check
+glimpse(stroke)
+dim(stroke)
+names(stroke)
+
+
+# 1) Exploratory Data Analysis (EDA)
+
+
+
+# 1.1 Outcome distribution (class imbalance check)
+table(stroke$stroke)
+prop.table(table(stroke$stroke))
+
+stroke %>%
+  count(stroke) %>%
+  mutate(prop = n / sum(n))
+
+# 1.2 Missing values check
+colSums(is.na(stroke))
+
+missing_df <- tibble(
+  variable     = names(stroke),
+  missing_n    = colSums(is.na(stroke)),
+  missing_prop = colSums(is.na(stroke)) / nrow(stroke)
+) %>%
+  arrange(desc(missing_n))
+
+missing_df %>% filter(missing_n > 0)
+
+# Ensure BMI is numeric (helps avoid plotting/model issues if read as character)
+stroke$bmi <- suppressWarnings(as.numeric(stroke$bmi))
+
+# 1.3 Identify numeric vs categorical variables
+num_vars <- names(stroke)[sapply(stroke, is.numeric)]
+cat_vars <- setdiff(names(stroke), num_vars)
+
+# Summaries (numeric + categorical)
+stroke %>% select(all_of(num_vars)) %>% summary()
+
+lapply(stroke[cat_vars], function(x) {
+  sort(table(x), decreasing = TRUE)[1:min(10, length(table(x)))]
+})
+
+# 1.4 Simple plots to understand the data
+stroke_plot <- stroke %>%
+  mutate(stroke = factor(stroke, levels = c(0, 1), labels = c("No stroke", "Stroke")))
+
+# Outcome bar chart
+ggplot(stroke_plot, aes(x = stroke)) +
+  geom_bar() +
+  labs(title = "Stroke outcome distribution", x = "Outcome", y = "Count")
+
+# Key numeric variables: histograms + boxplots by outcome
+key_numeric <- intersect(c("age", "bmi", "avg_glucose_level"), names(stroke))
+key_numeric <- key_numeric[sapply(stroke[key_numeric], is.numeric)]
+
+for (v in key_numeric) {
+  print(
+    ggplot(stroke, aes(x = .data[[v]])) +
+      geom_histogram(bins = 30) +
+      labs(title = paste("Distribution of", v), x = v, y = "Count")
+  )
+}
+
+for (v in key_numeric) {
+  print(
+    ggplot(stroke_plot, aes(x = stroke, y = .data[[v]])) +
+      geom_boxplot() +
+      labs(title = paste(v, "by stroke outcome"), x = "Outcome", y = v)
+  )
+}
+
+# Key categorical variables: proportional bars (stroke proportion by group)
+key_cat <- intersect(c("gender", "ever_married", "work_type", "smoking_status"), names(stroke_plot))
+
+for (v in key_cat) {
+  print(
+    ggplot(stroke_plot, aes(x = .data[[v]], fill = stroke)) +
+      geom_bar(position = "fill") +
+      coord_flip() +
+      labs(title = paste("Stroke proportion by", v), x = v, y = "Proportion")
+  )
+}
+
+
+
+
+
+# 2) Preprocessing
+
+
+# 2.1 Remove non-informative identifier
+stroke <- stroke %>% select(-id)
+
+# 2.2 Convert outcome + categorical variables to factors
+# NOTE: Keep stroke as factor "0"/"1" for GLM/DL; SVM will be recoded later
+stroke <- stroke %>%
+  mutate(
+    stroke         = factor(stroke, levels = c(0, 1)),
+    gender         = factor(gender),
+    ever_married   = factor(ever_married),
+    work_type      = factor(work_type),
+    Residence_type = factor(Residence_type),
+    smoking_status = factor(smoking_status)
+  )
+
+# 2.3 Handle missing BMI using median imputation
+stroke$bmi[is.na(stroke$bmi)] <- median(stroke$bmi, na.rm = TRUE)
+
+# Confirm BMI has no missing values after imputation
+sum(is.na(stroke$bmi))
+summary(stroke$bmi)
+
+
+# 3) Train/Test Split (stratified)
+
+
+set.seed(123)  # reproducibility
+
+# Stratified split preserves stroke/no-stroke proportions in train and test
+train_index <- createDataPartition(stroke$stroke, p = 0.7, list = FALSE)
+
+train_data <- stroke[train_index, ]
+test_data  <- stroke[-train_index, ]
+
+# Quick check that imbalance is preserved
+prop.table(table(train_data$stroke))
+prop.table(table(test_data$stroke))
+
+
+# 4) Model 1: Logistic Regression (GLM baseline)
+
+
+set.seed(123)
+
+# Fit logistic regression (binomial family with logit link)
+glm_model <- glm(stroke ~ ., data = train_data, family = binomial)
+
+# Predict probabilities on test set
+glm_prob <- predict(glm_model, newdata = test_data, type = "response")
+
+# Convert probabilities to class labels using 0.5 threshold
+# NOTE: factor levels must match test_data$stroke levels ("0","1")
+glm_pred <- factor(ifelse(glm_prob >= 0.5, "1", "0"), levels = c("0", "1"))
+
+# Confusion matrix (set positive class = "1" i.e., Stroke)
+glm_cm <- confusionMatrix(glm_pred, test_data$stroke, positive = "1")
+glm_cm
+
+# ROC + AUC (use numeric 0/1 for ROC)
+y_test_num_glm <- as.numeric(as.character(test_data$stroke))  # 0/1
+glm_roc <- pROC::roc(response = y_test_num_glm, predictor = glm_prob)
+glm_auc <- pROC::auc(glm_roc)
+
+glm_auc
+plot(glm_roc, main = "ROC Curve - Logistic Regression (GLM)")
+
+
+
+# 5) Model 2: Support Vector Machine (Radial Kernel)
+
+
+set.seed(123)
+
+# For caret's twoClassSummary, the FIRST level is treated as the "event"/positive class.
+# We therefore recode the outcome to c("Stroke","NoStroke") so "Stroke" is positive.
+train_svm <- train_data
+test_svm  <- test_data
+
+train_svm$stroke <- factor(ifelse(train_svm$stroke == "1", "Stroke", "NoStroke"),
+                          levels = c("Stroke", "NoStroke"))
+
+test_svm$stroke <- factor(ifelse(test_svm$stroke == "1", "Stroke", "NoStroke"),
+                         levels = c("Stroke", "NoStroke"))
+
+# Cross-validation setup (optimise ROC)
+svm_ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+# Train SVM (RBF kernel). preProcess standardises numeric predictors.
+svm_model <- train(
+  stroke ~ .,
+  data      = train_svm,
+  method    = "svmRadial",
+  trControl = svm_ctrl,
+  metric    = "ROC",
+  preProcess = c("center", "scale"),
+  tuneLength = 5
+)
+
+svm_model
+
+# Predict probabilities and classes on the test set
+svm_prob <- predict(svm_model, newdata = test_svm, type = "prob")[, "Stroke"]
+svm_pred <- predict(svm_model, newdata = test_svm)
+
+# Confusion matrix (explicit positive = Stroke)
+svm_cm <- confusionMatrix(svm_pred, test_svm$stroke, positive = "Stroke")
+svm_cm
+
+# ROC + AUC
+svm_roc <- pROC::roc(
+  response  = ifelse(test_svm$stroke == "Stroke", 1, 0),
+  predictor = svm_prob
+)
+svm_auc <- pROC::auc(svm_roc)
+
+svm_auc
+plot(svm_roc, main = "ROC Curve - SVM (Radial)")
+
+
+
+
+
+# 6) Model 3: Deep Learning (Feed-forward Neural Network)
+
+
+set.seed(123)
+
+# 6.1 Separate predictors/response
+x_train <- train_data %>% select(-stroke)
+y_train <- train_data$stroke
+
+x_test  <- test_data %>% select(-stroke)
+y_test  <- test_data$stroke
+
+# 6.2 One-hot encode categorical variables (creates numeric model matrix)
+x_train_mat <- model.matrix(~ . - 1, data = x_train)
+x_test_mat  <- model.matrix(~ . - 1, data = x_test)
+
+# 6.3 Scale using TRAINING statistics only (avoids data leakage)
+x_train_mat <- scale(x_train_mat)
+x_test_mat  <- scale(
+  x_test_mat,
+  center = attr(x_train_mat, "scaled:center"),
+  scale  = attr(x_train_mat, "scaled:scale")
+)
+
+# Convert y to numeric 0/1 for Keras
+y_train_num <- as.numeric(as.character(y_train))  # 0/1
+y_test_num  <- as.numeric(as.character(y_test))   # 0/1
+
+# 6.4 Class weights (handle imbalance: penalise mistakes on stroke more)
+class_counts <- table(y_train_num)
+class_weight <- list(
+  "0" = as.numeric(sum(class_counts) / (2 * class_counts["0"])),
+  "1" = as.numeric(sum(class_counts) / (2 * class_counts["1"]))
+)
+
+# 6.5 Define neural network architecture
+dl_model <- keras_model_sequential() %>%
+  layer_dense(units = 64, activation = "relu", input_shape = ncol(x_train_mat)) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+# 6.6 Compile model (binary classification)
+dl_model %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss      = "binary_crossentropy",
+  metrics   = c("accuracy")
+)
+
+# 6.7 Train the model
+history <- dl_model %>% fit(
+  x               = x_train_mat,
+  y               = y_train_num,
+  epochs          = 50,
+  batch_size      = 32,
+  validation_split = 0.2,
+  class_weight    = class_weight,
+  verbose         = 1
+)
+
+# 6.8 Predict probabilities and classes on test set
+dl_prob <- as.numeric(dl_model %>% predict(x_test_mat))
+dl_pred <- factor(ifelse(dl_prob >= 0.5, "1", "0"), levels = c("0", "1"))
+
+# Confusion matrix (positive = "1" stroke)
+dl_cm <- confusionMatrix(dl_pred, y_test, positive = "1")
+dl_cm
+
+# ROC + AUC
+dl_roc <- pROC::roc(response = y_test_num, predictor = dl_prob)
+dl_auc <- pROC::auc(dl_roc)
+
+dl_auc
+plot(dl_roc, main = "ROC Curve - Deep Learning (Keras)")
+
+
+
+
+
+
+# 7) Model Comparison Summary (table + plots)
+
+
+# Extract key metrics in a consistent way
+glm_acc  <- as.numeric(glm_cm$overall["Accuracy"])
+glm_sens <- as.numeric(glm_cm$byClass["Sensitivity"])
+glm_spec <- as.numeric(glm_cm$byClass["Specificity"])
+glm_bal  <- (glm_sens + glm_spec) / 2
+
+svm_acc  <- as.numeric(svm_cm$overall["Accuracy"])
+svm_sens <- as.numeric(svm_cm$byClass["Sensitivity"])
+svm_spec <- as.numeric(svm_cm$byClass["Specificity"])
+svm_bal  <- (svm_sens + svm_spec) / 2
+
+dl_acc   <- as.numeric(dl_cm$overall["Accuracy"])
+dl_sens  <- as.numeric(dl_cm$byClass["Sensitivity"])
+dl_spec  <- as.numeric(dl_cm$byClass["Specificity"])
+dl_bal   <- (dl_sens + dl_spec) / 2
+
+# Create comparison table
+results_table <- tibble(
+  Model            = c("GLM (Logistic Regression)", "SVM (Radial)", "Deep Learning (Keras)"),
+  Accuracy         = c(glm_acc, svm_acc, dl_acc),
+  Sensitivity      = c(glm_sens, svm_sens, dl_sens),
+  Specificity      = c(glm_spec, svm_spec, dl_spec),
+  BalancedAccuracy = c(glm_bal, svm_bal, dl_bal),
+  AUC              = c(as.numeric(glm_auc), as.numeric(svm_auc), as.numeric(dl_auc))
+) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+results_table
+
+# 7.1 Combined ROC curve plot
+roc_df <- bind_rows(
+  tibble(fpr = 1 - glm_roc$specificities, tpr = glm_roc$sensitivities, model = "GLM"),
+  tibble(fpr = 1 - svm_roc$specificities, tpr = svm_roc$sensitivities, model = "SVM"),
+  tibble(fpr = 1 - dl_roc$specificities,  tpr = dl_roc$sensitivities,  model = "Deep Learning")
+)
+
+ggplot(roc_df, aes(x = fpr, y = tpr, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(
+    title = "ROC Curves (Test Set)",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  )
+
+# 7.2 Metric comparison bar chart
+metrics_long <- results_table %>%
+  select(Model, Accuracy, Sensitivity, Specificity, BalancedAccuracy, AUC) %>%
+  pivot_longer(-Model, names_to = "Metric", values_to = "Value")
+
+ggplot(metrics_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(title = "Model Performance Comparison (Test Set)", y = "Value", x = "")
